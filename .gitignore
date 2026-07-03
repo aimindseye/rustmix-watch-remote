@@ -1,0 +1,25 @@
+# Android / Gradle
+.gradle/
+build/
+**/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin/IDE
+.kotlin/
+.idea/
+*.iml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Artifacts
+*.apk
+*.aab
+*.zip
+!docs/**/*.zip
