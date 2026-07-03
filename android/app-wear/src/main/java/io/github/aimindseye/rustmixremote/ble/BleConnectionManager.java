@@ -1,7 +1,5 @@
 package io.github.aimindseye.rustmixremote.ble;
 
-import android.Manifest;
-import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -12,74 +10,89 @@ import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
-import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
-import android.content.pm.PackageManager;
-import android.os.Build;
+import android.content.SharedPreferences;
 
-import java.util.Collections;
 import java.util.List;
-
-import io.github.aimindseye.rustmixremote.protocol.RemoteCommand;
-import io.github.aimindseye.rustmixremote.protocol.RemotePacket;
+import java.util.Locale;
 
 public final class BleConnectionManager {
     public interface Listener {
         void onStatus(String status);
         void onDeviceFound(String name, String address);
-        void onConnected();
+        void onConnected(String name, String address);
         void onDisconnected();
+        void onWriteSent(String label);
     }
+
+    private static final String TAG = "RustmixRemoteBLE";
+    private static final String PREFS = "rustmix_remote";
+    private static final String KEY_DEVICE_ADDRESS = "device_address";
+    private static final String DEFAULT_RUSTMIX_ADDRESS = "9C:13:9E:B1:3D:66";
 
     private final Context context;
     private final Listener listener;
+    private final SharedPreferences prefs;
+    private final BluetoothAdapter adapter;
+
+    private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic commandCharacteristic;
-    private byte sequence = 0;
-    private boolean scanning = false;
+    private boolean scanning;
+    private int sequence;
 
     public BleConnectionManager(Context context, Listener listener) {
         this.context = context.getApplicationContext();
         this.listener = listener;
+        this.prefs = this.context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+
+        BluetoothManager manager =
+                (BluetoothManager) this.context.getSystemService(Context.BLUETOOTH_SERVICE);
+        this.adapter = manager != null ? manager.getAdapter() : null;
     }
 
-    public boolean hasRuntimePermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            return context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-                    && context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    public String getSavedDeviceAddress() {
+        String saved = prefs.getString(KEY_DEVICE_ADDRESS, "");
+        if (saved == null || saved.trim().isEmpty()) {
+            return DEFAULT_RUSTMIX_ADDRESS;
         }
-        return true;
+        return saved.trim().toUpperCase(Locale.US);
     }
 
-    @SuppressLint("MissingPermission")
-    public void scanAndConnect() {
-        if (!hasRuntimePermissions()) {
-            listener.onStatus("Bluetooth permissions needed");
+    public void saveDeviceAddress(String address) {
+        String normalized = normalizeAddress(address);
+        if (normalized.isEmpty()) {
+            listener.onStatus("No address entered");
             return;
         }
+        prefs.edit().putString(KEY_DEVICE_ADDRESS, normalized).apply();
+        listener.onStatus("Saved device: " + normalized);
+    }
 
-        BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
-        if (manager == null) {
+    public boolean isConnected() {
+        return gatt != null && commandCharacteristic != null;
+    }
+
+    public void startScanOrConnect(String preferredAddress) {
+        if (adapter == null) {
             listener.onStatus("Bluetooth unavailable");
             return;
         }
 
-        BluetoothAdapter adapter = manager.getAdapter();
-        if (adapter == null || !adapter.isEnabled()) {
-            listener.onStatus("Bluetooth is off");
-            return;
+        String normalized = normalizeAddress(preferredAddress);
+        if (!normalized.isEmpty()) {
+            prefs.edit().putString(KEY_DEVICE_ADDRESS, normalized).apply();
         }
 
-        BluetoothLeScanner scanner = adapter.getBluetoothLeScanner();
+        String fallbackAddress = getSavedDeviceAddress();
+
+        scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
-            listener.onStatus("BLE scanner unavailable");
-            return;
-        }
-
-        if (scanning) {
-            listener.onStatus("Already scanning");
+            listener.onStatus("BLE scanner unavailable; using saved address");
+            connectToAddress(fallbackAddress);
             return;
         }
 
@@ -89,191 +102,318 @@ public final class BleConnectionManager {
 
         scanning = true;
         listener.onStatus("Scanning for Rustmix Remote...");
-        android.util.Log.i("RustmixRemoteBLE", "startScan broad null-filter");
-        scanner.startScan(null, settings, scanCallback);
+        android.util.Log.i(TAG, "startScan broad null-filter fallback=" + fallbackAddress);
 
-        // ESP32-S3 firmware log reports BLE MAC 9C:13:9E:B1:3D:66.
-        // If Wear OS scanning does not deliver callbacks, try direct GATT connect.
+        try {
+            scanner.startScan(null, settings, scanCallback);
+        } catch (SecurityException e) {
+            android.util.Log.e(TAG, "scan permission denied", e);
+            listener.onStatus("BLE scan permission denied; using saved address");
+            connectToAddress(fallbackAddress);
+            return;
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "scan failed immediately", e);
+            listener.onStatus("BLE scan failed; using saved address");
+            connectToAddress(fallbackAddress);
+            return;
+        }
+
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
             if (scanning && gatt == null) {
-                android.util.Log.i("RustmixRemoteBLE", "scan fallback: direct connect to known Rustmix MAC");
-                try {
-                    BluetoothDevice known = adapter.getRemoteDevice("9C:13:9E:B1:3D:66");
-                    listener.onDeviceFound("Rustmix Remote", known.getAddress());
-                    try {
-                        scanner.stopScan(scanCallback);
-                    } catch (Exception ignored) {
-                    }
-                    scanning = false;
-                    listener.onStatus("Connecting to Rustmix Remote...");
-                    gatt = known.connectGatt(context, false, gattCallback);
-                } catch (Exception e) {
-                    android.util.Log.e("RustmixRemoteBLE", "direct connect fallback failed", e);
-                    listener.onStatus("Rustmix Remote not found");
-                }
+                android.util.Log.i(TAG, "scan fallback: direct connect to saved Rustmix MAC " + getSavedDeviceAddress());
+                listener.onStatus("Fallback connecting to saved device...");
+                connectToAddress(getSavedDeviceAddress());
             }
         }, 5000);
     }
 
-    @SuppressLint("MissingPermission")
-    public void disconnect() {
-        if (gatt != null) {
-            gatt.disconnect();
-            gatt.close();
-            gatt = null;
+    public void connectToAddress(String address) {
+        if (adapter == null) {
+            listener.onStatus("Bluetooth unavailable");
+            return;
         }
-        commandCharacteristic = null;
-        listener.onDisconnected();
-        listener.onStatus("Disconnected");
+
+        String normalized = normalizeAddress(address);
+        if (normalized.isEmpty()) {
+            listener.onStatus("No saved device address");
+            return;
+        }
+
+        stopScanQuietly();
+
+        try {
+            BluetoothDevice device = adapter.getRemoteDevice(normalized);
+            listener.onDeviceFound("Rustmix Remote", normalized);
+            listener.onStatus("Connecting to Rustmix Remote...");
+            android.util.Log.i(TAG, "direct connect address=" + normalized);
+
+            closeGattQuietly();
+            gatt = device.connectGatt(context, false, gattCallback);
+        } catch (SecurityException e) {
+            android.util.Log.e(TAG, "connect permission denied", e);
+            listener.onStatus("BLE connect permission denied");
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "direct connect failed", e);
+            listener.onStatus("Connect failed: " + e.getMessage());
+        }
     }
 
-    @SuppressLint("MissingPermission")
-    public boolean send(RemoteCommand command) {
-        if (!hasRuntimePermissions()) {
-            listener.onStatus("Bluetooth permissions needed");
-            return false;
+    public void disconnect() {
+        stopScanQuietly();
+
+        if (gatt == null) {
+            commandCharacteristic = null;
+            listener.onStatus("Disconnected");
+            listener.onDisconnected();
+            return;
         }
+
+        try {
+            listener.onStatus("Disconnecting...");
+            android.util.Log.i(TAG, "disconnect requested");
+            gatt.disconnect();
+        } catch (SecurityException e) {
+            android.util.Log.e(TAG, "disconnect permission denied", e);
+            closeGattQuietly();
+            listener.onDisconnected();
+        }
+    }
+
+    public boolean sendNext() {
+        return sendCommand((byte) 0x01, "next");
+    }
+
+    public boolean sendPrevious() {
+        return sendCommand((byte) 0x02, "previous");
+    }
+
+    private boolean sendCommand(byte command, String label) {
         if (gatt == null || commandCharacteristic == null) {
             listener.onStatus("Not connected");
             return false;
         }
 
-        byte[] packet = RemotePacket.command(sequence++, command);
+        byte[] packet = new byte[] {
+                0x01,
+                (byte) (sequence++ & 0xFF),
+                command,
+                0x00,
+                0x00,
+                0x00
+        };
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            int result = gatt.writeCharacteristic(
-                    commandCharacteristic,
-                    packet,
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            );
-            boolean ok = result == BluetoothGatt.GATT_SUCCESS;
-            listener.onStatus(ok ? "Sent " + command.name() : "Send failed: " + result);
-            return ok;
-        } else {
+        try {
             commandCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
             commandCharacteristic.setValue(packet);
-            boolean ok = gatt.writeCharacteristic(commandCharacteristic);
-            listener.onStatus(ok ? "Sent " + command.name() : "Send failed");
-            return ok;
-        }
-    }
 
-    @SuppressLint("MissingPermission")
-    private void connectTo(BluetoothDevice device) {
-        listener.onStatus("Connecting...");
-        gatt = device.connectGatt(context, false, gattCallback);
+            boolean ok = gatt.writeCharacteristic(commandCharacteristic);
+            if (ok) {
+                listener.onStatus("Write sent: " + label);
+                listener.onWriteSent(label);
+                android.util.Log.i(TAG, "write sent label=" + label + " bytes=" + bytesToHex(packet));
+            } else {
+                listener.onStatus("Write failed: " + label);
+                android.util.Log.w(TAG, "writeCharacteristic returned false label=" + label);
+            }
+            return ok;
+        } catch (SecurityException e) {
+            android.util.Log.e(TAG, "write permission denied", e);
+            listener.onStatus("BLE write permission denied");
+            return false;
+        }
     }
 
     private final ScanCallback scanCallback = new ScanCallback() {
-        @SuppressLint("MissingPermission")
         @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            BluetoothDevice device = result.getDevice();
-
-            String scanName = null;
-            if (result.getScanRecord() != null) {
-                scanName = result.getScanRecord().getDeviceName();
-            }
-
-            String deviceName = null;
-            try {
-                deviceName = device.getName();
-            } catch (SecurityException ignored) {
-                // BLUETOOTH_CONNECT may be denied on some Wear OS builds.
-            }
-
-            String name = scanName != null
-                    ? scanName
-                    : (deviceName != null ? deviceName : "Rustmix device");
-
-            String address = device.getAddress();
-
-            boolean hasRustmixService = false;
-            if (result.getScanRecord() != null && result.getScanRecord().getServiceUuids() != null) {
-                for (android.os.ParcelUuid uuid : result.getScanRecord().getServiceUuids()) {
-                    if (RustmixBleUuids.SERVICE.equals(uuid.getUuid())) {
-                        hasRustmixService = true;
-                        break;
-                    }
-                }
-            }
-
-            boolean hasRustmixName =
-                    (scanName != null && scanName.toLowerCase().contains("rustmix"))
-                            || (deviceName != null && deviceName.toLowerCase().contains("rustmix"));
-
-            // Firmware log shows BLE MAC 9c:13:9e:b1:3d:66.
-            boolean hasKnownRustmixAddress =
-                    "9C:13:9E:B1:3D:66".equalsIgnoreCase(address);
-
-            android.util.Log.i("RustmixRemoteBLE",
-                    "scan name=" + name
-                            + " scanName=" + scanName
-                            + " deviceName=" + deviceName
-                            + " address=" + address
-                            + " service=" + hasRustmixService
-                            + " rustmixName=" + hasRustmixName
-                            + " knownAddress=" + hasKnownRustmixAddress);
-
-            if (!hasRustmixService && !hasRustmixName && !hasKnownRustmixAddress) {
-                return;
-            }
-
-            listener.onDeviceFound(name, address);
-
-            BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
-            if (manager != null && manager.getAdapter() != null && scanning) {
-                BluetoothLeScanner scanner = manager.getAdapter().getBluetoothLeScanner();
-                if (scanner != null) {
-                    scanner.stopScan(this);
-                }
-            }
-            scanning = false;
-            connectTo(device);
+        public void onScanFailed(int errorCode) {
+            android.util.Log.e(TAG, "scan failed errorCode=" + errorCode);
+            listener.onStatus("BLE scan failed: " + errorCode);
         }
 
         @Override
-        public void onScanFailed(int errorCode) {
-            scanning = false;
-            listener.onStatus("Scan failed: " + errorCode);
+        public void onScanResult(int callbackType, ScanResult result) {
+            handleScanResult(result);
+        }
+
+        @Override
+        public void onBatchScanResults(List<ScanResult> results) {
+            if (results == null) {
+                return;
+            }
+            for (ScanResult result : results) {
+                handleScanResult(result);
+            }
         }
     };
 
+    private void handleScanResult(ScanResult result) {
+        if (result == null || result.getDevice() == null) {
+            return;
+        }
+
+        BluetoothDevice device = result.getDevice();
+        String address = device.getAddress();
+
+        ScanRecord record = result.getScanRecord();
+        String scanName = record != null ? record.getDeviceName() : null;
+
+        String deviceName = null;
+        try {
+            deviceName = device.getName();
+        } catch (SecurityException ignored) {
+        }
+
+        String name = scanName != null
+                ? scanName
+                : (deviceName != null ? deviceName : "BLE device");
+
+        boolean hasRustmixService = false;
+        if (record != null && record.getServiceUuids() != null) {
+            for (android.os.ParcelUuid uuid : record.getServiceUuids()) {
+                if (RustmixBleUuids.SERVICE.equals(uuid.getUuid())) {
+                    hasRustmixService = true;
+                    break;
+                }
+            }
+        }
+
+        boolean hasRustmixName =
+                containsRustmix(scanName) || containsRustmix(deviceName);
+
+        boolean hasSavedAddress =
+                getSavedDeviceAddress().equalsIgnoreCase(address);
+
+        android.util.Log.i(TAG,
+                "scan name=" + name
+                        + " scanName=" + scanName
+                        + " deviceName=" + deviceName
+                        + " address=" + address
+                        + " service=" + hasRustmixService
+                        + " rustmixName=" + hasRustmixName
+                        + " savedAddress=" + hasSavedAddress);
+
+        if (!hasRustmixService && !hasRustmixName && !hasSavedAddress) {
+            return;
+        }
+
+        saveDeviceAddress(address);
+        listener.onDeviceFound(name, address);
+        listener.onStatus("Found Rustmix Remote; connecting...");
+        connectToAddress(address);
+    }
+
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
         @Override
-        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+        public void onConnectionStateChange(BluetoothGatt bluetoothGatt, int status, int newState) {
+            android.util.Log.i(TAG, "connection state status=" + status + " newState=" + newState);
+
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                listener.onStatus("Discovering services...");
-                gatt.discoverServices();
+                gatt = bluetoothGatt;
+                listener.onStatus("Connected; discovering services...");
+                try {
+                    bluetoothGatt.discoverServices();
+                } catch (SecurityException e) {
+                    android.util.Log.e(TAG, "discoverServices permission denied", e);
+                    listener.onStatus("Service discovery permission denied");
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 commandCharacteristic = null;
-                listener.onDisconnected();
+                closeGattQuietly();
                 listener.onStatus("Disconnected");
+                listener.onDisconnected();
             }
         }
 
         @Override
-        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+        public void onServicesDiscovered(BluetoothGatt bluetoothGatt, int status) {
+            android.util.Log.i(TAG, "services discovered status=" + status);
+
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 listener.onStatus("Service discovery failed: " + status);
                 return;
             }
 
-            BluetoothGattService service = gatt.getService(RustmixBleUuids.SERVICE);
+            BluetoothGattService service = bluetoothGatt.getService(RustmixBleUuids.SERVICE);
             if (service == null) {
-                listener.onStatus("Rustmix Remote service not found");
+                listener.onStatus("Rustmix service not found");
+                android.util.Log.w(TAG, "Rustmix service not found");
                 return;
             }
 
-            commandCharacteristic = service.getCharacteristic(RustmixBleUuids.COMMAND);
-            if (commandCharacteristic == null) {
-                listener.onStatus("Command characteristic not found");
+            BluetoothGattCharacteristic characteristic =
+                    service.getCharacteristic(RustmixBleUuids.COMMAND);
+
+            if (characteristic == null) {
+                listener.onStatus("Rustmix command characteristic not found");
+                android.util.Log.w(TAG, "Rustmix command characteristic not found");
                 return;
             }
 
-            listener.onConnected();
-            listener.onStatus("Connected to Rustmix Remote");
+            commandCharacteristic = characteristic;
+            String address = bluetoothGatt.getDevice() != null ? bluetoothGatt.getDevice().getAddress() : getSavedDeviceAddress();
+            saveDeviceAddress(address);
+            listener.onConnected("Rustmix Remote", address);
+            listener.onStatus("Connected");
+        }
+
+        @Override
+        public void onCharacteristicWrite(
+                BluetoothGatt bluetoothGatt,
+                BluetoothGattCharacteristic characteristic,
+                int status
+        ) {
+            android.util.Log.i(TAG, "write callback status=" + status);
         }
     };
+
+    private void stopScanQuietly() {
+        if (!scanning) {
+            return;
+        }
+        scanning = false;
+
+        if (scanner == null) {
+            return;
+        }
+
+        try {
+            scanner.stopScan(scanCallback);
+        } catch (SecurityException ignored) {
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void closeGattQuietly() {
+        if (gatt != null) {
+            try {
+                gatt.close();
+            } catch (SecurityException ignored) {
+            } catch (Exception ignored) {
+            }
+        }
+        gatt = null;
+        commandCharacteristic = null;
+    }
+
+    private static String normalizeAddress(String address) {
+        if (address == null) {
+            return "";
+        }
+        return address.trim().toUpperCase(Locale.US);
+    }
+
+    private static boolean containsRustmix(String value) {
+        return value != null && value.toLowerCase(Locale.US).contains("rustmix");
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(String.format(Locale.US, "%02X", b));
+        }
+        return sb.toString();
+    }
 }

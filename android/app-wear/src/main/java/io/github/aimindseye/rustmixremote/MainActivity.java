@@ -1,37 +1,128 @@
 package io.github.aimindseye.rustmixremote;
 
-import android.Manifest;
 import android.app.Activity;
-import android.content.pm.PackageManager;
-import android.graphics.Color;
-import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
-import android.view.View;
-import android.view.ViewGroup;
+import android.view.MotionEvent;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.ViewFlipper;
 
 import io.github.aimindseye.rustmixremote.ble.BleConnectionManager;
-import io.github.aimindseye.rustmixremote.haptics.HapticFeedbackController;
-import io.github.aimindseye.rustmixremote.protocol.RemoteCommand;
 
-public final class MainActivity extends Activity implements BleConnectionManager.Listener {
-    private static final int REQUEST_BLUETOOTH = 1001;
-
-    private TextView statusView;
-    private TextView deviceView;
+public class MainActivity extends Activity {
     private BleConnectionManager ble;
-    private HapticFeedbackController haptics;
+
+    private ViewFlipper flipper;
+
+    private TextView remoteStatusText;
+    private TextView deviceStatusText;
+    private TextView savedDeviceText;
+
+    private EditText addressEdit;
+
+    private Button prevButton;
+    private Button nextButton;
+    private Button disconnectButton;
+    private Button connectSavedButton;
+    private Button scanButton;
+
+    private float touchDownX;
+    private float touchDownY;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        ble = new BleConnectionManager(this, this);
-        haptics = new HapticFeedbackController(this);
-        setContentView(buildUi());
-        requestBluetoothPermissionsIfNeeded();
+
+        ble = new BleConnectionManager(this, new BleConnectionManager.Listener() {
+            @Override
+            public void onStatus(String status) {
+                runOnUiThread(() -> {
+                    remoteStatusText.setText(status);
+                    deviceStatusText.setText(status);
+                });
+            }
+
+            @Override
+            public void onDeviceFound(String name, String address) {
+                runOnUiThread(() -> {
+                    savedDeviceText.setText("Saved\n" + address);
+                    addressEdit.setText(address);
+                });
+            }
+
+            @Override
+            public void onConnected(String name, String address) {
+                runOnUiThread(() -> {
+                    savedDeviceText.setText("Connected\n" + address);
+                    addressEdit.setText(address);
+                    remoteStatusText.setText("● Connected");
+                    deviceStatusText.setText("Connected");
+                    setConnectedUi(true);
+                    showRemoteScreen();
+                });
+            }
+
+            @Override
+            public void onDisconnected() {
+                runOnUiThread(() -> {
+                    remoteStatusText.setText("○ Disconnected");
+                    deviceStatusText.setText("Disconnected");
+                    setConnectedUi(false);
+                });
+            }
+
+            @Override
+            public void onWriteSent(String label) {
+                runOnUiThread(() -> {
+                    String text = "Write sent: " + label;
+                    remoteStatusText.setText(text);
+                    deviceStatusText.setText(text);
+                });
+            }
+        });
+
+        flipper = new ViewFlipper(this);
+        flipper.addView(createRemoteScreen());
+        flipper.addView(createDeviceScreen());
+
+        setContentView(flipper);
+        setConnectedUi(false);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                touchDownX = event.getX();
+                touchDownY = event.getY();
+                break;
+
+            case MotionEvent.ACTION_UP:
+                float dx = event.getX() - touchDownX;
+                float dy = event.getY() - touchDownY;
+
+                boolean horizontalSwipe =
+                        Math.abs(dx) > dp(45) && Math.abs(dx) > Math.abs(dy) * 1.25f;
+
+                if (horizontalSwipe) {
+                    if (dx < 0) {
+                        showDeviceScreen();
+                    } else {
+                        showRemoteScreen();
+                    }
+                    return true;
+                }
+                break;
+
+            default:
+                break;
+        }
+
+        return super.dispatchTouchEvent(event);
     }
 
     @Override
@@ -40,115 +131,186 @@ public final class MainActivity extends Activity implements BleConnectionManager
         super.onDestroy();
     }
 
-    private View buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER);
-        root.setPadding(18, 12, 18, 12);
-        root.setBackgroundColor(Color.BLACK);
-        root.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-        ));
+    private LinearLayout createRemoteScreen() {
+        LinearLayout root = baseScreen();
 
-        TextView title = new TextView(this);
-        title.setText("Rustmix Remote");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(18);
-        title.setGravity(Gravity.CENTER);
-        root.addView(title, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
+        TextView title = title("Rustmix Remote");
+        root.addView(title, fullWidth());
 
-        statusView = new TextView(this);
-        statusView.setText("Disconnected");
-        statusView.setTextColor(Color.LTGRAY);
-        statusView.setTextSize(12);
-        statusView.setGravity(Gravity.CENTER);
-        root.addView(statusView);
+        remoteStatusText = smallText("○ Disconnected");
+        root.addView(remoteStatusText, fullWidth());
 
-        deviceView = new TextView(this);
-        deviceView.setText("No device");
-        deviceView.setTextColor(Color.GRAY);
-        deviceView.setTextSize(10);
-        deviceView.setGravity(Gravity.CENTER);
-        root.addView(deviceView);
+        LinearLayout arrows = new LinearLayout(this);
+        arrows.setOrientation(LinearLayout.HORIZONTAL);
+        arrows.setGravity(Gravity.CENTER);
 
-        Button connect = makeButton("Scan / Connect");
-        connect.setOnClickListener(v -> ble.scanAndConnect());
-        root.addView(connect);
+        prevButton = new Button(this);
+        prevButton.setText("◀\nPrev");
+        prevButton.setTextSize(16);
+        prevButton.setOnClickListener(v -> ble.sendPrevious());
+        arrows.addView(prevButton, halfWidthTall());
 
-        Button next = makeButton("Next Page →");
-        next.setOnClickListener(v -> send(RemoteCommand.PAGE_NEXT));
-        root.addView(next);
+        nextButton = new Button(this);
+        nextButton.setText("▶\nNext");
+        nextButton.setTextSize(16);
+        nextButton.setOnClickListener(v -> ble.sendNext());
+        arrows.addView(nextButton, halfWidthTall());
 
-        Button previous = makeButton("← Previous");
-        previous.setOnClickListener(v -> send(RemoteCommand.PAGE_PREVIOUS));
-        root.addView(previous);
+        root.addView(arrows, fullWidth());
 
-        Button menu = makeButton("Menu");
-        menu.setOnClickListener(v -> send(RemoteCommand.MENU));
-        root.addView(menu);
+        disconnectButton = new Button(this);
+        disconnectButton.setText("Disconnect");
+        disconnectButton.setTextSize(12);
+        disconnectButton.setOnClickListener(v -> ble.disconnect());
+        root.addView(disconnectButton, fullWidth());
 
-        Button back = makeButton("Back");
-        back.setOnClickListener(v -> send(RemoteCommand.BACK));
-        root.addView(back);
+        Button deviceButton = new Button(this);
+        deviceButton.setText("Device →");
+        deviceButton.setTextSize(12);
+        deviceButton.setOnClickListener(v -> showDeviceScreen());
+        root.addView(deviceButton, fullWidth());
+
+        TextView hint = smallText("Swipe left for Device");
+        root.addView(hint, fullWidth());
 
         return root;
     }
 
-    private Button makeButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
-        button.setTextSize(13);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
+    private ScrollView createDeviceScreen() {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
+
+        LinearLayout root = baseScreen();
+
+        TextView title = title("Device");
+        root.addView(title, fullWidth());
+
+        deviceStatusText = smallText("Disconnected");
+        root.addView(deviceStatusText, fullWidth());
+
+        savedDeviceText = smallText("Saved\n" + ble.getSavedDeviceAddress());
+        root.addView(savedDeviceText, fullWidth());
+
+        addressEdit = new EditText(this);
+        addressEdit.setSingleLine(true);
+        addressEdit.setText(ble.getSavedDeviceAddress());
+        addressEdit.setTextSize(12);
+        addressEdit.setHint("BLE MAC");
+        root.addView(addressEdit, fullWidth());
+
+        Button saveButton = new Button(this);
+        saveButton.setText("Save Address");
+        saveButton.setTextSize(12);
+        saveButton.setOnClickListener(v -> {
+            ble.saveDeviceAddress(addressEdit.getText().toString());
+            savedDeviceText.setText("Saved\n" + ble.getSavedDeviceAddress());
+        });
+        root.addView(saveButton, fullWidth());
+
+        connectSavedButton = new Button(this);
+        connectSavedButton.setText("Connect Saved");
+        connectSavedButton.setTextSize(12);
+        connectSavedButton.setOnClickListener(v -> {
+            ble.saveDeviceAddress(addressEdit.getText().toString());
+            savedDeviceText.setText("Saved\n" + ble.getSavedDeviceAddress());
+            ble.connectToAddress(ble.getSavedDeviceAddress());
+        });
+        root.addView(connectSavedButton, fullWidth());
+
+        scanButton = new Button(this);
+        scanButton.setText("Scan / Fallback");
+        scanButton.setTextSize(12);
+        scanButton.setOnClickListener(v -> {
+            ble.saveDeviceAddress(addressEdit.getText().toString());
+            savedDeviceText.setText("Saved\n" + ble.getSavedDeviceAddress());
+            ble.startScanOrConnect(ble.getSavedDeviceAddress());
+        });
+        root.addView(scanButton, fullWidth());
+
+        Button remoteButton = new Button(this);
+        remoteButton.setText("← Remote");
+        remoteButton.setTextSize(12);
+        remoteButton.setOnClickListener(v -> showRemoteScreen());
+        root.addView(remoteButton, fullWidth());
+
+        TextView hint = smallText("Swipe right for Remote");
+        root.addView(hint, fullWidth());
+
+        scroll.addView(root);
+        return scroll;
+    }
+
+    private void showRemoteScreen() {
+        flipper.setDisplayedChild(0);
+    }
+
+    private void showDeviceScreen() {
+        flipper.setDisplayedChild(1);
+    }
+
+    private void setConnectedUi(boolean connected) {
+        if (prevButton != null) {
+            prevButton.setEnabled(connected);
+        }
+        if (nextButton != null) {
+            nextButton.setEnabled(connected);
+        }
+        if (disconnectButton != null) {
+            disconnectButton.setEnabled(connected);
+        }
+        if (connectSavedButton != null) {
+            connectSavedButton.setEnabled(!connected);
+        }
+        if (scanButton != null) {
+            scanButton.setEnabled(!connected);
+        }
+    }
+
+    private LinearLayout baseScreen() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER_HORIZONTAL);
+        int pad = dp(8);
+        root.setPadding(pad, pad, pad, pad);
+        return root;
+    }
+
+    private TextView title(String text) {
+        TextView v = new TextView(this);
+        v.setText(text);
+        v.setTextSize(17);
+        v.setGravity(Gravity.CENTER);
+        return v;
+    }
+
+    private TextView smallText(String text) {
+        TextView v = new TextView(this);
+        v.setText(text);
+        v.setTextSize(11);
+        v.setGravity(Gravity.CENTER);
+        return v;
+    }
+
+    private LinearLayout.LayoutParams fullWidth() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        params.setMargins(0, 4, 0, 4);
-        button.setLayoutParams(params);
-        return button;
+        p.setMargins(0, dp(2), 0, dp(2));
+        return p;
     }
 
-    private void send(RemoteCommand command) {
-        if (ble.send(command)) {
-            haptics.tick();
-        }
+    private LinearLayout.LayoutParams halfWidthTall() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+                0,
+                dp(92),
+                1.0f
+        );
+        p.setMargins(dp(3), dp(4), dp(3), dp(4));
+        return p;
     }
 
-    private void requestBluetoothPermissionsIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            boolean needsScan = checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED;
-            boolean needsConnect = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED;
-            if (needsScan || needsConnect) {
-                requestPermissions(new String[] {
-                        Manifest.permission.BLUETOOTH_SCAN,
-                        Manifest.permission.BLUETOOTH_CONNECT
-                }, REQUEST_BLUETOOTH);
-            }
-        }
-    }
-
-    @Override
-    public void onStatus(String status) {
-        runOnUiThread(() -> statusView.setText(status));
-    }
-
-    @Override
-    public void onDeviceFound(String name, String address) {
-        runOnUiThread(() -> deviceView.setText(name + "\n" + address));
-    }
-
-    @Override
-    public void onConnected() {
-        runOnUiThread(() -> statusView.setText("Connected"));
-        haptics.tick();
-    }
-
-    @Override
-    public void onDisconnected() {
-        runOnUiThread(() -> statusView.setText("Disconnected"));
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }
