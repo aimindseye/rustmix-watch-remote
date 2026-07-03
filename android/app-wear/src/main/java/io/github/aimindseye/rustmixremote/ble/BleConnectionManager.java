@@ -18,9 +18,9 @@ import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
-import android.os.ParcelUuid;
 
 import java.util.Collections;
+import java.util.List;
 
 import io.github.aimindseye.rustmixremote.protocol.RemoteCommand;
 import io.github.aimindseye.rustmixremote.protocol.RemotePacket;
@@ -83,16 +83,36 @@ public final class BleConnectionManager {
             return;
         }
 
-        ScanFilter filter = new ScanFilter.Builder()
-                .setServiceUuid(new ParcelUuid(RustmixBleUuids.SERVICE))
-                .build();
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build();
 
         scanning = true;
         listener.onStatus("Scanning for Rustmix Remote...");
-        scanner.startScan(Collections.singletonList(filter), settings, scanCallback);
+        android.util.Log.i("RustmixRemoteBLE", "startScan broad null-filter");
+        scanner.startScan(null, settings, scanCallback);
+
+        // ESP32-S3 firmware log reports BLE MAC 9C:13:9E:B1:3D:66.
+        // If Wear OS scanning does not deliver callbacks, try direct GATT connect.
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+            if (scanning && gatt == null) {
+                android.util.Log.i("RustmixRemoteBLE", "scan fallback: direct connect to known Rustmix MAC");
+                try {
+                    BluetoothDevice known = adapter.getRemoteDevice("9C:13:9E:B1:3D:66");
+                    listener.onDeviceFound("Rustmix Remote", known.getAddress());
+                    try {
+                        scanner.stopScan(scanCallback);
+                    } catch (Exception ignored) {
+                    }
+                    scanning = false;
+                    listener.onStatus("Connecting to Rustmix Remote...");
+                    gatt = known.connectGatt(context, false, gattCallback);
+                } catch (Exception e) {
+                    android.util.Log.e("RustmixRemoteBLE", "direct connect fallback failed", e);
+                    listener.onStatus("Rustmix Remote not found");
+                }
+            }
+        }, 5000);
     }
 
     @SuppressLint("MissingPermission")
@@ -149,8 +169,57 @@ public final class BleConnectionManager {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             BluetoothDevice device = result.getDevice();
-            String name = device.getName() != null ? device.getName() : "Rustmix device";
-            listener.onDeviceFound(name, device.getAddress());
+
+            String scanName = null;
+            if (result.getScanRecord() != null) {
+                scanName = result.getScanRecord().getDeviceName();
+            }
+
+            String deviceName = null;
+            try {
+                deviceName = device.getName();
+            } catch (SecurityException ignored) {
+                // BLUETOOTH_CONNECT may be denied on some Wear OS builds.
+            }
+
+            String name = scanName != null
+                    ? scanName
+                    : (deviceName != null ? deviceName : "Rustmix device");
+
+            String address = device.getAddress();
+
+            boolean hasRustmixService = false;
+            if (result.getScanRecord() != null && result.getScanRecord().getServiceUuids() != null) {
+                for (android.os.ParcelUuid uuid : result.getScanRecord().getServiceUuids()) {
+                    if (RustmixBleUuids.SERVICE.equals(uuid.getUuid())) {
+                        hasRustmixService = true;
+                        break;
+                    }
+                }
+            }
+
+            boolean hasRustmixName =
+                    (scanName != null && scanName.toLowerCase().contains("rustmix"))
+                            || (deviceName != null && deviceName.toLowerCase().contains("rustmix"));
+
+            // Firmware log shows BLE MAC 9c:13:9e:b1:3d:66.
+            boolean hasKnownRustmixAddress =
+                    "9C:13:9E:B1:3D:66".equalsIgnoreCase(address);
+
+            android.util.Log.i("RustmixRemoteBLE",
+                    "scan name=" + name
+                            + " scanName=" + scanName
+                            + " deviceName=" + deviceName
+                            + " address=" + address
+                            + " service=" + hasRustmixService
+                            + " rustmixName=" + hasRustmixName
+                            + " knownAddress=" + hasKnownRustmixAddress);
+
+            if (!hasRustmixService && !hasRustmixName && !hasKnownRustmixAddress) {
+                return;
+            }
+
+            listener.onDeviceFound(name, address);
 
             BluetoothManager manager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
             if (manager != null && manager.getAdapter() != null && scanning) {
