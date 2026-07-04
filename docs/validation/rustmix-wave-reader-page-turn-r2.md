@@ -8,12 +8,10 @@ Validated path:
 - Firmware target: Rustmix-Wave on Waveshare ESP32-S3 3.97-inch e-paper
 - Transport: BLE GATT
 - Protocol: Rustmix Remote BLE Protocol / RRBP
-- Service UUID: `8f7a0000-6b8f-4a91-9e2c-727573740001`
-- Command UUID: `8f7a0001-6b8f-4a91-9e2c-727573740001`
 
 Accepted UI behavior:
 
-- Swipeable 2-screen UI works.
+- Swipeable two-screen UI works.
 - Remote screen provides Previous, Next, Disconnect, and Device navigation.
 - Device screen provides saved BLE address, Connect Saved, Scan / Fallback, and Remote navigation.
 - Direct saved-address fallback works for the accepted Rustmix-Wave BLE MAC.

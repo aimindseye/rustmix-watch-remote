@@ -1,88 +1,87 @@
 # Rustmix Remote Architecture
 
-## Product
+Rustmix Remote is a Wear OS BLE remote for Rustmix reader firmware.
 
-Rustmix Remote is a Wear OS smartwatch remote for Rustmix e-paper firmware devices.
+## v1.0.0 architecture
 
-It is intentionally separate from the Vaachak platform. Rustmix Remote is optimized for custom firmware targets where we control both sides of the connection.
-
-## Targets
-
-### Phase 1
-
-- Rustmix-Wave / Waveshare ESP32-S3 3.97-inch e-paper
-
-### Phase 2
-
-- rustmix-x4-firmware / Xteink X4
-
-## Primary protocol
-
-Rustmix Remote uses a custom BLE GATT protocol.
-
-The watch acts as BLE central/client.
-
-The e-paper firmware acts as BLE peripheral/server and advertises the Rustmix Remote service.
-
-## Data flow
-
-```text
-Watch UI gesture
-    ↓
-Rustmix Remote command
-    ↓
-BLE GATT write
-    ↓
-Firmware BLE command parser
-    ↓
-RemoteEvent queue
-    ↓
-Main firmware event loop
-    ↓
-Existing reader/UI action
+```
+Samsung Wear OS Watch
+        |
+        | BLE GATT write
+        v
+Rustmix-Wave BLE GATT service
+        |
+        | RRBP command queue
+        v
+Rustmix-Wave main loop
+        |
+        | reader input event
+        v
+TXT / EPUB reader page navigation
 ```
 
-## Firmware safety rule
+## Protocol
 
-BLE callbacks must not directly mutate reader or UI state.
+Rustmix Remote uses the Rustmix Remote BLE Protocol, abbreviated RRBP.
 
-BLE callbacks may only:
+Validated service UUID:
 
-1. Validate the packet.
-2. Convert it to a RemoteEvent.
-3. Push the event onto a queue.
+```
+8f7a0000-6b8f-4a91-9e2c-727573740001
+```
 
-The main firmware loop consumes the event and routes it through the existing input/navigation path.
+Validated command characteristic UUID:
 
-## MVP commands
+```
+8f7a0001-6b8f-4a91-9e2c-727573740001
+```
 
-- Page next
-- Page previous
+RRBP command packets are 6 bytes:
 
-## Later commands
+```
+byte 0: version
+byte 1: sequence
+byte 2: command
+byte 3: flags
+byte 4: parameter
+byte 5: reserved
+```
 
-- Back
-- Menu
-- Select
-- Scroll up
-- Scroll down
-- Sleep
-- Wake / keep awake
-- Toggle bookmark
-- Refresh / ghost cleanup
+Accepted command examples:
 
-## Rustmix-Wave first
+```
+01 00 01 00 00 00 = page next
+01 02 02 00 00 00 = page previous
+```
 
-Rustmix-Wave should be the first firmware target because the ESP32-S3 has more headroom and the firmware already has accepted Reader, Library, Settings, sleep, refresh, and navigation behavior.
+## Firmware safety model
 
-## X4 second
+The BLE callback parses and enqueues only. Reader state is mutated by the Rustmix-Wave main loop after the command is drained from the queue.
 
-X4 support should be more conservative because earlier BLE adapter-bind work was intentionally quarantined. X4 should use a separate, minimal BLE remote receiver and must not reuse the adapter-bind path.
+Accepted embedded boundary:
 
-## Non-goals
+```
+BLE callback: parse/enqueue only
+main loop: mutate UI/reader state
+```
 
-- Bluetooth HID keyboard emulation
-- Boox support
-- Android phone support
-- Vaachak platform integration
-- Generic remote control for third-party e-readers
+## Connectivity model
+
+The app attempts scan first. If scan does not produce a Rustmix result, the app falls back to direct GATT connect using the saved BLE MAC address.
+
+This is the accepted v1.0.0 behavior for the Samsung Wear OS validation device.
+
+## Rustmix-Wave BLE feature build boundary
+
+The Rustmix-Wave `rustmix-remote-ble` build owns the ESP32-S3 modem.
+
+In this build:
+
+- BLE GATT is enabled.
+- Wi-Fi is intentionally skipped.
+- NTP is unavailable.
+- Weather/network services are unavailable.
+- Wi-Fi transfer is unavailable.
+- TXT and EPUB page turning over BLE are accepted.
+
+Normal non-BLE Rustmix-Wave builds must continue to preserve Wi-Fi behavior.
